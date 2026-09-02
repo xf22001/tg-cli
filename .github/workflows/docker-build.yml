@@ -1,0 +1,84 @@
+name: Build and Upload Artifacts (Dockerized)
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'Select Ubuntu version for Docker build environment'
+        required: true
+        default: '22.04'
+        type: choice
+        options:
+          - '20.04'
+          - '22.04'
+          - '24.04'
+          - latest
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set environment variables
+        shell: bash
+        run: |
+          DEPLOY_DIR="${{ github.workspace }}/build"
+          DOCKER_DEPLOY_DIR="/app/build"
+          DEST="$DEPLOY_DIR/linux-${{ matrix.arch }}"
+          DOCKER_DEST="$DOCKER_DEPLOY_DIR/linux-${{ matrix.arch }}"
+
+          echo "DEPLOY_DIR=$DEPLOY_DIR" >> "$GITHUB_ENV"
+          echo "DEST=$DEST" >> "$GITHUB_ENV"
+          echo "DOCKER_DEST=$DOCKER_DEST" >> "$GITHUB_ENV"
+
+      - name: Build the project (in Docker)
+        shell: bash
+        run: |
+          mkdir -p "${{ env.DEST }}"
+
+          cat << 'EOF' > docker_build_internal.sh
+          set -e
+          apt-get update && apt-get install -y wget curl ca-certificates git
+          git config --global --add safe.directory "*"
+
+          GO_VERSION=$(grep -E '^go [0-9]+\.[0-9]+' go.mod | awk '{print $2}' || echo "1.25.0")
+          echo "Installing Go ${GO_VERSION}..."
+
+          wget -q "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -O /tmp/go.tar.gz || \
+          wget -q "https://go.dev/dl/go1.25.0.linux-amd64.tar.gz" -O /tmp/go.tar.gz
+
+          rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz
+          export PATH="/usr/local/go/bin:$PATH"
+
+          go version
+
+          echo "Building tg for linux/$GOARCH to $DOCKER_DEST/tg"
+          CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH go build -v -trimpath -buildvcs=false -ldflags "-w -s" -o "$DOCKER_DEST/tg" ./cmd/tg
+          EOF
+
+          chmod +x docker_build_internal.sh
+
+          docker run --rm \
+            -v "${{ github.workspace }}:/app" \
+            -w /app \
+            -e GOARCH="${{ matrix.arch }}" \
+            -e DOCKER_DEST="${{ env.DOCKER_DEST }}" \
+            ubuntu:${{ github.event.inputs.os }} \
+            /bin/bash /app/docker_build_internal.sh
+
+          rm -f docker_build_internal.sh
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tg-docker-ubuntu${{ github.event.inputs.os }}-linux-${{ matrix.arch }}
+          path: ${{ env.DEST }}
